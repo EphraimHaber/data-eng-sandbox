@@ -1,0 +1,29 @@
+{
+  "name": "data-eng-sandbox-docs",
+  "type": "module",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check": "astro check",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.42.8",
+    "@fontsource-variable/archivo": "5.3.0",
+    "@fontsource-variable/atkinson-hyperlegible-next": "5.3.0",
+    "@fontsource/ibm-plex-mono": "5.3.0",
+    "astro": "7.4.4",
+    "sharp": "0.35.5",
+    "starlight-links-validator": "0.27.0"
+  },
+  "engines": {
+    "node": ">=22.23.4"
+  },
+  "devDependencies": {
+    "@astrojs/check": "0.9.12",
+    "typescript": "6.0.3"
+  }
+}

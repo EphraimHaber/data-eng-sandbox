@@ -1,0 +1,64 @@
+# Builds the Astro/Starlight site in docs/ and publishes it to GitHub Pages.
+#
+# One-time setup: repository Settings > Pages > Build and deployment >
+# Source: "GitHub Actions". Without that, the deploy job fails.
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+  # Pull requests run the build (type check + link validation) but never deploy.
+  pull_request:
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One Pages deployment at a time. A newer push waits for a running deployment
+# instead of cancelling it partway through.
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          # Full history, so Starlight's "Last updated" dates come from each
+          # page's last commit rather than from a shallow clone.
+          fetch-depth: 0
+
+      # Installs dependencies from docs/package-lock.json, then runs the
+      # build command, then uploads docs/dist as the Pages artifact.
+      # `astro check` fails on type errors; `astro build` fails on broken
+      # internal links (starlight-links-validator).
+      - name: Check, build and upload the site
+        uses: withastro/action@v6
+        with:
+          path: docs
+          node-version: 24
+          build-cmd: npm run check && npm run build
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

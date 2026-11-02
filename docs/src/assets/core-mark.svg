@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 32" width="24" height="32">
+  <!-- A three-layer ice core: fresh ice, a tephra marker, old ice. -->
+  <defs>
+    <clipPath id="c"><rect x="5" y="1" width="14" height="30" rx="3.5"/></clipPath>
+    <linearGradient id="s" x1="0" x2="1">
+      <stop offset="0" stop-color="#000" stop-opacity=".25"/>
+      <stop offset=".3" stop-color="#fff" stop-opacity=".25"/>
+      <stop offset=".6" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#000" stop-opacity=".3"/>
+    </linearGradient>
+  </defs>
+  <g clip-path="url(#c)">
+    <rect x="5" y="1" width="14" height="10" fill="#9cc4d6"/>
+    <rect x="5" y="11" width="14" height="3.5" fill="#c08a2c"/>
+    <rect x="5" y="14.5" width="14" height="7" fill="#5f97b0"/>
+    <rect x="5" y="21.5" width="14" height="9.5" fill="#2f6f8f"/>
+    <rect x="5" y="1" width="14" height="30" fill="url(#s)"/>
+  </g>
+</svg>

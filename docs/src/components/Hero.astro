@@ -1,0 +1,88 @@
+---
+/**
+ * Override of Starlight's <Hero>. It takes the same `hero` frontmatter (title,
+ * tagline, actions) but drops the centred layout and the image slot in favour of
+ * a left-aligned headline next to the <IceCore> illustration.
+ *
+ * Wired up in astro.config.mjs → starlight({ components: { Hero } }).
+ *
+ * Action links in frontmatter must include the base path
+ * (/data-eng-sandbox/...), the same as links in Markdown. The links validator
+ * checks them at build time.
+ */
+import { LinkButton } from '@astrojs/starlight/components';
+import IceCore from './IceCore.astro';
+
+const { data } = Astro.locals.starlightRoute.entry;
+const { title = data.title, tagline, actions = [] } = data.hero || {};
+---
+
+<div class="hero">
+	<div class="copy">
+		<h1 id="_top" data-page-title set:html={title} />
+		{tagline && <p class="tagline" set:html={tagline} />}
+		{
+			actions.length > 0 && (
+				<div class="actions">
+					{actions.map(({ attrs: { class: className, ...attrs } = {}, icon, link, text, variant }) => (
+						<LinkButton href={link} {variant} icon={icon?.name} class:list={[className]} {...attrs}>
+							{text}
+						</LinkButton>
+					))}
+				</div>
+			)
+		}
+	</div>
+	<IceCore />
+</div>
+
+<style>
+	.hero {
+		display: grid;
+		gap: 3rem;
+		padding-block: clamp(2rem, 6vmin, 5rem) 2rem;
+	}
+
+	.copy {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 1.5rem;
+	}
+
+	h1 {
+		margin: 0;
+		max-width: 14ch;
+		font-family: var(--ds-font-display);
+		font-stretch: 125%;
+		font-weight: 760;
+		font-size: clamp(2.25rem, 1.2rem + 4.2vw, 4.5rem);
+		line-height: 1.02;
+		letter-spacing: -0.02em;
+		color: var(--sl-color-white);
+		text-wrap: balance;
+	}
+
+	.tagline {
+		margin: 0;
+		max-width: 52ch;
+		font-size: clamp(var(--sl-text-base), 0.9rem + 0.5vw, var(--sl-text-xl));
+		line-height: 1.6;
+		color: var(--sl-color-gray-2);
+	}
+
+	.actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 1rem 1.5rem;
+		margin-top: 0.5rem;
+	}
+
+	@media (min-width: 50rem) {
+		.hero {
+			grid-template-columns: minmax(0, 1fr) auto;
+			align-items: center;
+			gap: clamp(2rem, 5vw, 5rem);
+		}
+	}
+</style>
