@@ -11,6 +11,10 @@ stored on S3-compatible object storage (RustFS).
 docker compose up -d --build     # then open http://localhost:8080
 ```
 
+For editor autocompletion and linting, `uv sync` creates a local `.venv` with Airflow and
+PySpark at the same versions as the images (on Python 3.10+). See [`pyproject.toml`](pyproject.toml)
+for the versions used on Python 3.8 and 3.9.
+
 - [Architecture: which process runs where](#architecture-which-process-runs-where)
 - [Versions and why they fit together](#versions-and-why-they-fit-together)
 - [Starting the sandbox](#starting-the-sandbox)
@@ -535,6 +539,8 @@ What could **not** be verified here:
 .
 ├── docker-compose.yml          all services, one network, healthchecks, startup order
 ├── .env                        ports, credentials, sizes (sandbox values only)
+├── pyproject.toml, uv.lock     local uv virtualenv (Python 3.8-3.14) for editors; not used by the images
+├── .python-version             uv's default interpreter: 3.12, same as the images
 ├── conf/spark-defaults.conf    Iceberg catalog, jars, resources: shared by every Spark process
 ├── docker/
 │   ├── spark/Dockerfile        Spark 4.1.3 + Java 17 on Python 3.12 + Iceberg/AWS/JDBC jars
