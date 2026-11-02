@@ -1,0 +1,195 @@
+---
+/**
+ * The landing-page illustration: an ice core where each band is one Iceberg
+ * snapshot. The thick band at the bottom is the initial full load; every band
+ * above it is a ten-minute incremental sync. The ochre band is an earlier
+ * snapshot you can still query with time travel.
+ *
+ * This is the site's one piece of motion: on page load the newest band settles
+ * onto the top of the core. Motion is off when the reader prefers reduced motion.
+ */
+
+type Layer = {
+	/** What the label says. Empty for unlabelled bands. */
+	label?: string;
+	/** Band height in rem. */
+	height: number;
+	/** 0 = fresh, pale ice; 1 = old, dense blue ice. */
+	depth: number;
+	kind?: 'new' | 'marker' | 'base';
+};
+
+const layers: Layer[] = [
+	{ label: '12:40 latest sync', height: 2.4, depth: 0, kind: 'new' },
+	{ label: '12:30', height: 1.9, depth: 0.12 },
+	{ label: '12:20', height: 2.3, depth: 0.22 },
+	{ label: '12:10 time-travel target', height: 0.9, depth: 0.3, kind: 'marker' },
+	{ label: '12:00', height: 2.1, depth: 0.4 },
+	{ height: 1.4, depth: 0.48 },
+	{ height: 1.7, depth: 0.55 },
+	{ label: 'Initial load', height: 6, depth: 0.8, kind: 'base' },
+];
+---
+
+<figure class="ice-core">
+	<ol class="layers">
+		{
+			layers.map((layer) => (
+				<li
+					class:list={['layer', layer.kind]}
+					style={`--h: ${layer.height}rem; --depth: ${layer.depth * 100}%;`}
+				>
+					<span class="band" aria-hidden="true" />
+					{layer.label ? <span class="label">{layer.label}</span> : <span class="label" aria-hidden="true" />}
+				</li>
+			))
+		}
+	</ol>
+	<figcaption>
+		Each sync adds one snapshot to the table. Older snapshots stay queryable until maintenance
+		expires them.
+	</figcaption>
+</figure>
+
+<style>
+	.ice-core {
+		--core-w: clamp(5.5rem, 10vw, 8rem);
+		--ice-fresh: color-mix(in srgb, var(--ds-glacier) 55%, var(--ds-firn));
+		--ice-old: color-mix(in srgb, var(--ds-meltwater) 75%, var(--ds-deep-core));
+		margin: 0;
+		display: grid;
+		gap: 1.25rem;
+		justify-items: start;
+	}
+
+	.layers {
+		position: relative;
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: grid;
+	}
+
+	/* Cylinder shading over the whole core: darker at the edges, a highlight
+	   left of centre. It sits above the bands so they read as one sample. */
+	.layers::before {
+		content: '';
+		position: absolute;
+		inset-block: 0;
+		inset-inline-start: 0;
+		width: var(--core-w);
+		border-radius: 0.75rem;
+		background: linear-gradient(
+			90deg,
+			rgb(0 0 0 / 0.28) 0%,
+			rgb(255 255 255 / 0.22) 28%,
+			rgb(255 255 255 / 0) 55%,
+			rgb(0 0 0 / 0.32) 100%
+		);
+		pointer-events: none;
+		z-index: 1;
+	}
+
+	.layer {
+		display: grid;
+		grid-template-columns: var(--core-w) auto;
+		align-items: center;
+		margin: 0;
+	}
+
+	.band {
+		height: var(--h);
+		background:
+			/* fine annual-style striations inside each band */
+			repeating-linear-gradient(
+				180deg,
+				rgb(255 255 255 / 0) 0 3px,
+				rgb(255 255 255 / 0.1) 3px 4px
+			),
+			color-mix(in srgb, var(--ice-old) var(--depth), var(--ice-fresh));
+		/* a darker seam where one snapshot meets the next */
+		box-shadow: inset 0 -1px 0 rgb(0 0 0 / 0.22);
+	}
+
+	.layer:first-child .band {
+		border-start-start-radius: 0.75rem;
+		border-start-end-radius: 0.75rem;
+	}
+
+	.layer:last-child .band {
+		border-end-start-radius: 0.75rem;
+		border-end-end-radius: 0.75rem;
+	}
+
+	.marker .band {
+		background: var(--ds-tephra);
+	}
+
+	.label {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		padding-inline-start: 0.6rem;
+		/* Labels use the display face, like the stencilled depth marks on a core box. */
+		font-family: var(--ds-font-display);
+		font-stretch: 112%;
+		font-size: var(--sl-text-sm);
+		line-height: 1.2;
+		color: var(--sl-color-gray-3);
+		white-space: nowrap;
+	}
+
+	.label:not(:empty)::before {
+		content: '';
+		width: 1.25rem;
+		border-top: 1px solid currentColor;
+		opacity: 0.6;
+	}
+
+	.new .label {
+		color: var(--sl-color-white);
+		font-weight: 650;
+	}
+
+	.marker .label {
+		color: var(--ds-tephra);
+		font-weight: 650;
+	}
+
+	figcaption {
+		max-width: 30ch;
+		font-size: var(--sl-text-sm);
+		line-height: 1.5;
+		color: var(--sl-color-gray-3);
+	}
+
+	/* The single orchestrated moment: the newest snapshot settles onto the core. */
+	@media (prefers-reduced-motion: no-preference) {
+		.new .band {
+			animation: settle 900ms cubic-bezier(0.2, 0.9, 0.25, 1.05) 250ms both;
+		}
+
+		.new .label {
+			animation: appear 400ms ease-out 1000ms both;
+		}
+
+		@keyframes settle {
+			from {
+				transform: translateY(-2.5rem);
+				opacity: 0;
+			}
+			60% {
+				opacity: 1;
+			}
+			to {
+				transform: none;
+			}
+		}
+
+		@keyframes appear {
+			from {
+				opacity: 0;
+			}
+		}
+	}
+</style>

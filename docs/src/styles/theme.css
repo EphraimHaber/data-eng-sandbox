@@ -1,0 +1,121 @@
+/*
+ * Theme for the data-eng sandbox docs.
+ *
+ * Concept: an ice core. An Iceberg table builds up as a stack of snapshots,
+ * one every ten minutes, the way a glacier lays down layers. The palette is
+ * taken from a core sample: cold blues for the ice, and one ochre "tephra"
+ * band. Ice-core scientists use volcanic ash layers as dated markers. Here the
+ * ochre marks the snapshot you time-travel to. That ochre only appears in the
+ * hero and on keyboard focus, so it always means "look here".
+ *
+ * Tokens
+ *   firn        #F3F7F9  light background (fresh, compacted snow)
+ *   deep-core   #12202D  dark background, light-mode ink
+ *   glacier     #9CC4D6  pale ice, dark-mode accent text
+ *   meltwater   #2F6F8F  accent, links in light mode
+ *   tephra      #A8741A  marker colour (lighter #D9A441 on dark)
+ *   slate       #5A6B78  secondary text
+ *
+ * Type
+ *   Archivo (expanded width) for headings: wide, engraved-label feel.
+ *   Atkinson Hyperlegible Next for body: built for character recognition,
+ *   which helps with identifiers like `spark-master:7077` in running text.
+ *   IBM Plex Mono for code only.
+ *
+ * Starlight exposes everything as --sl-* custom properties. We override them
+ * outside Starlight's cascade layers, so these values win without !important.
+ */
+
+:root {
+	--ds-firn: #f3f7f9;
+	--ds-deep-core: #12202d;
+	--ds-glacier: #9cc4d6;
+	--ds-meltwater: #2f6f8f;
+	--ds-tephra: #d9a441;
+	--ds-slate: #8796a3;
+
+	--sl-font: 'Atkinson Hyperlegible Next Variable';
+	--sl-font-mono: 'IBM Plex Mono';
+	--ds-font-display: 'Archivo Variable', var(--sl-font-system);
+
+	/* Dark mode (Starlight's default) */
+	--sl-color-white: #f3f7f9;
+	--sl-color-gray-1: #dde6ec;
+	--sl-color-gray-2: #b9c7d1;
+	--sl-color-gray-3: #8796a3;
+	--sl-color-gray-4: #56677a;
+	--sl-color-gray-5: #2c3f52;
+	--sl-color-gray-6: #192a3a;
+	--sl-color-black: #12202d;
+
+	--sl-color-accent-low: #1d3b4e;
+	--sl-color-accent: #4e9ab8;
+	--sl-color-accent-high: #9cc4d6;
+
+	/* Re-tint Starlight's semantic hues (used by asides and badges) so notes
+	   read as glacier blue and cautions as tephra ochre, not stock indigo/orange. */
+	--sl-hue-blue: 200;
+	--sl-hue-orange: 38;
+
+	--sl-line-height-headings: 1.1;
+	--sl-content-width: 46rem;
+}
+
+:root[data-theme='light'] {
+	--ds-tephra: #a8741a;
+	--ds-slate: #5a6b78;
+
+	--sl-color-white: #12202d;
+	--sl-color-gray-1: #1d3040;
+	--sl-color-gray-2: #2c3f52;
+	--sl-color-gray-3: #5a6b78;
+	--sl-color-gray-4: #8796a3;
+	--sl-color-gray-5: #c5d3dc;
+	--sl-color-gray-6: #e3ebf0;
+	--sl-color-gray-7: #edf3f6;
+	--sl-color-black: #f3f7f9;
+
+	--sl-color-accent-low: #d3e6ee;
+	--sl-color-accent: #2f6f8f;
+	--sl-color-accent-high: #1f5570;
+}
+
+/* Headings: expanded Archivo. Large sizes get slightly tighter tracking,
+   because wide letterforms look loose at display sizes. */
+:is(h1, h2, h3, h4, h5, h6),
+.sl-markdown-content :is(h1, h2, h3, h4, h5, h6),
+.site-title {
+	font-family: var(--ds-font-display);
+	font-stretch: 118%;
+	font-weight: 680;
+}
+
+.sl-markdown-content :is(h1, h2) {
+	letter-spacing: -0.01em;
+}
+
+.sl-markdown-content :is(h4, h5, h6) {
+	font-stretch: 105%;
+	font-weight: 640;
+}
+
+.site-title {
+	font-size: var(--sl-text-lg);
+	letter-spacing: 0;
+}
+
+/* Lining, tabular figures keep timestamps and versions aligned. */
+body {
+	font-feature-settings: 'tnum' 1, 'lnum' 1;
+}
+
+/* Keyboard focus uses the tephra marker so it's visible on both themes and
+   distinct from link colour. */
+:focus-visible {
+	outline: 2px solid var(--ds-tephra);
+	outline-offset: 2px;
+}
+
+::selection {
+	background-color: color-mix(in srgb, var(--sl-color-accent) 35%, transparent);
+}

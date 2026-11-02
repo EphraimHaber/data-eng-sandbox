@@ -1,0 +1,21 @@
+---
+title: Postgres into Iceberg, ten minutes at a time
+description: A local sandbox for learning Airflow, Spark and Apache Iceberg by running a real incremental sync.
+template: splash
+hero:
+  tagline: A local sandbox for learning Airflow, Spark and Apache Iceberg together. One Docker Compose file starts a source database, a Spark cluster, an Iceberg catalog and RustFS object storage, then keeps them in sync.
+  actions:
+    - text: Start the stack
+      link: /data-eng-sandbox/start/quickstart/
+    - text: See what runs where
+      link: /data-eng-sandbox/start/architecture/
+      variant: minimal
+---
+
+## The path of one row
+
+1. An order is inserted or updated in the source Postgres database.
+2. Every ten minutes, Airflow starts a sync for the window that just closed.
+3. Spark reads that window from Postgres in parallel slices, one per executor task.
+4. Spark merges the rows into an Iceberg table on `id`, so a rerun gives the same result.
+5. Iceberg writes data files to RustFS and records a new snapshot in the REST catalog.
