@@ -15,6 +15,11 @@
 #   JOBS=16     parallel requests
 #   LIMIT=0     only check the first N builds (0 = all), handy for a dry run
 #   OUT=python-download-sizes.tsv   per-build results
+#   OS=""       only these OSes, comma-separated (e.g. linux,windows)
+#   SKIP_ARCH="" leave out these architectures, comma-separated (e.g. aarch64,armv7)
+#
+# Example: Linux and Windows only, no ARM
+#   OS=linux,windows SKIP_ARCH=aarch64,armv7 scripts/uv-python-download-sizes.sh
 #
 # Requires: curl, jq, xargs, awk, and uv (only if the JSON must be generated).
 
@@ -24,6 +29,8 @@ JSON="${1:-pythons.json}"
 JOBS="${JOBS:-16}"
 LIMIT="${LIMIT:-0}"
 OUT="${OUT:-python-download-sizes.tsv}"
+OS="${OS:-}"
+SKIP_ARCH="${SKIP_ARCH:-}"
 
 for cmd in curl jq xargs awk; do
   command -v "$cmd" >/dev/null || { echo "error: $cmd is not installed" >&2; exit 1; }
@@ -37,7 +44,17 @@ if [[ ! -f "$JSON" ]]; then
 fi
 
 # One row per build: key, implementation, os, url
-rows=$(jq -r '.[] | [.key, .implementation, .os, .url] | @tsv' "$JSON")
+rows=$(jq -r --arg os "$OS" --arg skip "$SKIP_ARCH" '
+  ($os   | split(",") | map(select(. != ""))) as $oses
+  | ($skip | split(",") | map(select(. != ""))) as $skips
+  | .[]
+  | select(($oses | length) == 0 or (.os as $o | $oses | index($o)))
+  | select(.arch as $a | $skips | index($a) | not)
+  | [.key, .implementation, .os, .url] | @tsv' "$JSON")
+if [[ -z "$rows" ]]; then
+  echo "error: no builds match OS=\"$OS\" SKIP_ARCH=\"$SKIP_ARCH\"" >&2
+  exit 1
+fi
 if [[ "$LIMIT" -gt 0 ]]; then
   rows=$(head -n "$LIMIT" <<<"$rows")
 fi
