@@ -1,0 +1,64 @@
+# =============================================================================
+# Local Python environment for the sandbox, managed with uv.
+#
+# The containers do NOT use this file: docker/airflow/Dockerfile and
+# docker/spark/Dockerfile pin their own versions and run Python 3.12. This
+# project gives you a local virtualenv with the same libraries, so editors,
+# linters and ad-hoc scripts can import `airflow` and `pyspark`.
+#
+#   uv sync                    # default interpreter (see .python-version)
+#   uv sync --python 3.9       # any of 3.8 ... 3.14
+#
+# One lockfile (uv.lock) covers every supported Python version. The packages
+# below use environment markers, because the newest releases have dropped
+# older Pythons:
+#
+#   Python      apache-airflow   providers-apache-spark   pyspark
+#   3.10-3.14   3.3.2            6.3.2                    4.1.3  (= the image)
+#   3.9         3.0.6            5.3.0                    4.0.5
+#   3.8         2.10.5           4.11.0                   3.5.9
+#
+# On 3.10+ the versions match the Docker images exactly. On 3.8 and 3.9 they
+# are the newest releases that still support that Python. On 3.8, Airflow is
+# 2.x, which has no `airflow.sdk`, so the DAG files will not import there.
+# Spark 3.5 also behaves differently from the cluster's Spark 4.1.
+# =============================================================================
+
+[project]
+name = "data-eng-sandbox"
+version = "0.1.0"
+description = "Postgres -> Spark -> Iceberg sandbox orchestrated by Airflow"
+readme = "README.md"
+# Airflow 2.10.x needs >=3.8.1; Airflow 3.3.x excludes 3.15.
+requires-python = ">=3.8.1,<3.15"
+dependencies = [
+    # --- Airflow (dags/) ------------------------------------------------------
+    "apache-airflow==3.3.2; python_version >= '3.10'",
+    "apache-airflow==3.0.6; python_version == '3.9'",
+    "apache-airflow==2.10.5; python_version < '3.9'",
+
+    # SparkSubmitOperator.
+    "apache-airflow-providers-apache-spark==6.3.2; python_version >= '3.10'",
+    "apache-airflow-providers-apache-spark==5.3.0; python_version == '3.9'",
+    "apache-airflow-providers-apache-spark==4.11.0; python_version < '3.9'",
+
+    # --- PySpark (jobs/) ------------------------------------------------------
+    # The 6.x provider depends on pyspark-client (the Spark Connect client).
+    # Pin it to the full PySpark's version, like the Airflow image does, so
+    # both packages install the same version.
+    "pyspark==4.1.3; python_version >= '3.10'",
+    "pyspark-client==4.1.3; python_version >= '3.10'",
+    "pyspark==4.0.5; python_version == '3.9'",
+    "pyspark==3.5.9; python_version < '3.9'",
+]
+
+[tool.uv]
+# This repo is a set of DAGs and Spark jobs, not an installable package:
+# uv installs the dependencies only, not the project itself.
+package = false
+# Python 3.8 only: the newest google-re2 (an Airflow 2.10 dependency) has no
+# 3.8 wheels and fails to build from source. Use the version from Airflow
+# 2.10.5's constraints-3.8.txt, which ships 3.8 wheels.
+constraint-dependencies = [
+    "google-re2==1.1.20240702; python_version < '3.9'",
+]
