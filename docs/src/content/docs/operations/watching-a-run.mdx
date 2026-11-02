@@ -1,0 +1,107 @@
+---
+title: Trigger and watch a run
+description: Start a sync by hand and follow it through Airflow, the Spark UIs and the task log.
+sidebar:
+  order: 1
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+Syncs run on their own every ten minutes, but you can also start one yourself and follow it through
+each layer.
+
+## Trigger a run
+
+<Tabs>
+<TabItem label="Airflow UI">
+
+Open [localhost:8080](http://localhost:8080), go to **Dags → orders_sync**, and click **Trigger**.
+
+- Leave the logical date empty to sync the **latest complete** window. It has usually been synced
+  already, so the run reads a few thousand rows and writes none.
+- Fill in a logical date or a data interval to (re)sync a specific window.
+
+`orders_full_load` and `iceberg_maintenance` trigger the same way.
+
+</TabItem>
+<TabItem label="CLI">
+
+```sh
+# latest complete window
+docker compose exec airflow-scheduler airflow dags trigger orders_sync
+
+# the latest complete window as of a chosen time
+docker compose exec airflow-scheduler airflow dags trigger orders_sync \
+  -l 2026-11-02T07:15:00+00:00
+
+docker compose exec airflow-scheduler airflow dags trigger orders_full_load
+docker compose exec airflow-scheduler airflow dags trigger iceberg_maintenance
+
+docker compose exec airflow-scheduler airflow dags list-runs orders_sync
+```
+
+</TabItem>
+<TabItem label="spark-submit directly">
+
+Skip Airflow and run the job yourself. It's useful for testing a window. Use
+`docker compose exec airflow-scheduler`, so the driver runs where executors can reach it:
+
+```sh
+docker compose exec airflow-scheduler spark-submit \
+  --conf spark.driver.host=airflow-scheduler \
+  /opt/airflow/jobs/sync_orders.py --mode incremental \
+  --start 2026-11-02T07:00:00+00:00 --end 2026-11-02T07:10:00+00:00
+```
+
+Running the same command twice is the quickest idempotency test: the second run reports `+0 records`.
+
+</TabItem>
+</Tabs>
+
+## Follow it through the layers
+
+| Where | What to look for |
+| --- | --- |
+| **Airflow grid view** | The run turns green, or orange while waiting for the `iceberg_orders` pool. A task stuck in **queued** usually means another writer holds the pool slot. |
+| **Task log** (click the task, then **Logs**) | The full `spark-submit` command, executors being added on `spark-worker-1` and `spark-worker-2`, and the job's own `sync_orders:` lines. |
+| **Spark master**, [localhost:8090](http://localhost:8090) | The running application, its 4 cores and which workers host its executors. |
+| **Spark driver**, [localhost:4040](http://localhost:4040) | **Jobs/Stages:** the JDBC read stage has one task per slice. **SQL:** the MERGE plan and its `Exchange` nodes (shuffles). **Executors:** the four executors plus the driver. Only available while the job runs. |
+| **Worker UIs**, [localhost:8081](http://localhost:8081) and [localhost:8082](http://localhost:8082) | Each executor's stdout and stderr. |
+| **RustFS console**, [localhost:9001/rustfs/console/](http://localhost:9001/rustfs/console/) | New files under `warehouse/sales/orders/data/created_at_day=…/` and `metadata/`. |
+
+Task logs are also plain files on your machine:
+
+```sh
+tail -f logs/dag_id=orders_sync/run_id=*/task_id=merge_changed_orders/attempt=1.log
+```
+
+## Reading the job's log lines
+
+```
+sync_orders: mode=incremental window: updated_at >= '2026-11-02T07:20:00+00:00'::timestamptz AND updated_at < '2026-11-02T07:30:00+00:00'::timestamptz
+sync_orders: JDBC read: 3014 rows, ids 29..101810, 2 partitions
+sync_orders: snapshot 4564330655857283829 (overwrite): +2716 records, position deletes +3451/-1510, total records in data files 105248
+```
+
+1. **The window**, exactly as Postgres receives it.
+2. **The bounds query result** and the number of parallel read slices derived from it.
+3. **The commit:**
+   - `overwrite` is how a merge-on-read MERGE appears in Iceberg. The first full load on an empty table
+     shows `append`.
+   - `+2716 records` is the number of new row versions written. That's fewer than the 3,014 rows read,
+     because rows already synced with the same `updated_at` are skipped.
+   - `position deletes +3451/-1510` means 1,941 rows were updated (3,451 − 1,510). The rest of the 2,716
+     were inserts. [The sync job](/data-eng-sandbox/pipeline/sync-job/#merge-on-read) explains why
+     earlier markers are carried over.
+   - `total records in data files` still counts old versions hidden by deletes, until compaction.
+
+Other lines you may see:
+
+- `lake.sales.orders does not exist yet: bootstrapping with a full load` appears on the first run of a
+  fresh stack.
+- `no changed rows in this window; nothing to do` means the job exits without committing.
+
+<Aside type="caution" title="Scary but harmless">
+The full task log is noisy: JVM warnings about incubator modules and the native Hadoop library, plus
+Spark's INFO lines. The `sync_orders:` lines and any Python traceback at the end are what matter.
+</Aside>

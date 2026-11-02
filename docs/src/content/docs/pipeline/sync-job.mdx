@@ -1,0 +1,226 @@
+---
+title: The sync job
+description: How the PySpark job reads a time window from Postgres and merges it into Iceberg.
+sidebar:
+  order: 1
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+`jobs/sync_orders.py` is one PySpark application with two modes:
+
+```sh
+spark-submit sync_orders.py --mode incremental \
+  --start 2026-11-02T06:40:00+00:00 --end 2026-11-02T06:50:00+00:00
+spark-submit sync_orders.py --mode full
+```
+
+The code runs in the **driver**, but the driver only plans. Every DataFrame operation becomes tasks on the
+**executors**. They open their own JDBC connections, shuffle among themselves and write Parquet straight to
+RustFS. The only things the driver ever collects are two single-row results: the bounds query and the
+commit summary.
+
+## What one run does
+
+<Steps>
+
+1. **Bootstrap check.** In incremental mode, if `lake.sales.orders` doesn't exist yet, switch to a full
+   load. A fresh stack therefore fills itself on the first scheduled run.
+2. **Create the table if it's missing,** partitioned by `days(created_at)`.
+3. **Bounds query.** Ask Postgres for `min(id)`, `max(id)` and `count(*)` of the rows in the window.
+   Stop early if the count is 0.
+4. **Parallel read** of the window, split into id slices.
+5. **Checkpoint** the rows on the executors, so Postgres is read exactly once.
+6. **MERGE** into the Iceberg table on `id`.
+7. **Log** the new snapshot's summary.
+
+</Steps>
+
+## Parallel JDBC reads
+
+A plain `spark.read.jdbc(url, "orders")` produces **one task**. One executor core opens one connection and
+pulls every row while the rest of the cluster sits idle. Every later stage then starts from that single
+partition.
+
+Given a numeric column and its range, Spark splits the work instead:
+
+```python
+df = (
+    spark.read.format("jdbc")
+    .options(**jdbc_options())
+    .option("dbtable", subquery)          # the window filter, run inside Postgres
+    .option("partitionColumn", "id")
+    .option("lowerBound", str(lo))        # from the bounds query
+    .option("upperBound", str(hi))
+    .option("numPartitions", str(num_partitions))
+    .load()
+)
+```
+
+Spark divides `[lowerBound, upperBound]` into equal strides and runs one query per stride. For four
+partitions over ids 1 to 100,000:
+
+```sql
+-- task 0
+SELECT ... FROM (<window>) src WHERE id < 25001 OR id IS NULL
+-- task 1
+SELECT ... FROM (<window>) src WHERE id >= 25001 AND id < 50001
+-- task 2
+SELECT ... FROM (<window>) src WHERE id >= 50001 AND id < 75001
+-- task 3
+SELECT ... FROM (<window>) src WHERE id >= 75001
+```
+
+Each task runs on whichever executor is free, with its own connection. A few details:
+
+- **The bounds come from a query, not a guess.** `SELECT min(id), max(id), count(*) … WHERE <window>` is an
+  aggregate Postgres answers from the `updated_at` index. That's far cheaper than moving rows, and the one
+  row it returns is metadata, so bringing it to the driver with `.first()` is fine.
+- **The bounds set the stride; they never filter.** The first and last slices are open-ended. On the very
+  first full load, the job counted 100,550 rows but wrote 100,560. Ten rows were inserted between the bounds
+  query and the read, and they landed in the open-ended last slice.
+- **Even ids give even tasks.** In incremental windows, updates hit random old ids and inserts all land at
+  the top of the range, so the last slice tends to be the biggest.
+- **The partition count scales with the data:** `ceil(count / rows_per_partition)`, at least 1 and at most
+  8. A full load of 100k rows uses 8 slices. A ten-minute window of about 3,000–7,000 rows uses 2 to 4.
+  The default of 2,000 rows per slice is deliberately small so you can *see* the parallelism. In production
+  you'd aim for hundreds of thousands of rows or more per task.
+- **`partitionColumn` can't be combined with the `query` option,** so the window filter goes into a
+  subquery passed as `dbtable`.
+- **`fetchsize=5000`.** pgjdbc's default of 0 buffers the entire result set in executor memory before
+  returning the first row.
+
+## Incremental windows from Airflow
+
+The job never stores a watermark. Airflow passes the run's data interval in, and the job reads a
+half-open range:
+
+```sql
+updated_at >= '2026-11-02T06:40:00+00:00'::timestamptz
+AND updated_at < '2026-11-02T06:50:00+00:00'::timestamptz
+```
+
+- **Half-open** means a row updated at exactly 06:50:00 belongs to the 06:50–07:00 run only. Consecutive
+  intervals tile the timeline with no gaps and no overlaps.
+- **Each run owns its window.** Retrying a failed attempt, or clearing a run a week later, re-reads exactly
+  the same slice of time. The job itself is stateless, and you can test it with any window you like.
+- **Timestamps must carry an offset.** The job rejects `2026-11-02T06:40:00` without `+00:00`, because a
+  window off by a few hours silently skips or duplicates data. Parsing the value also guarantees it's a
+  real timestamp before it's put into SQL text.
+- **The source has to cooperate.** A trigger sets `updated_at = now()` on every UPDATE, so no writer can
+  forget to bump it.
+
+## Idempotent writes with MERGE
+
+```sql
+MERGE INTO lake.sales.orders AS t
+USING source_orders AS s
+ON t.id = s.id
+WHEN MATCHED AND s.updated_at > t.updated_at THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
+```
+
+**Why not append?** Airflow retries failed tasks, and you'll rerun windows by hand. An append writes the
+same rows again on every attempt. Picture a task that crashes halfway through, or a write that commits
+and then the task times out: each retry leaves duplicate orders behind. With MERGE, the outcome depends
+only on the source rows, not on how many times the job ran:
+
+| Situation | Result |
+| --- | --- |
+| `id` not in the table | Insert it |
+| `id` present, source row is newer | Replace it with the source version |
+| `id` present, source row is not newer | Leave it alone |
+
+The last row is what makes a rerun a no-op, and it also stops an old window replayed late from
+overwriting a newer version. In testing, the same window run twice wrote 88 rows the first time and 0 the
+second.
+
+Iceberg commits the whole MERGE as **one snapshot**. Readers see all of it or none of it, and a failed
+attempt leaves no trace in the table, only unreferenced files that
+[maintenance](/data-eng-sandbox/operations/maintenance/) removes later.
+
+### Read the source once
+
+Before the MERGE, the job calls `source.localCheckpoint()`. A MERGE can evaluate its source more than once,
+for example once to find the affected files and once to write. Each evaluation would be a fresh JDBC read
+of a table that keeps changing, and two reads could disagree. The checkpoint runs the parallel read once
+and keeps the partitions **in executor memory and disk**. It isn't a `collect()`; nothing goes to the
+driver.
+
+## The Iceberg table
+
+```sql
+CREATE TABLE IF NOT EXISTS lake.sales.orders (
+    id BIGINT NOT NULL, customer_id BIGINT, amount DECIMAL(12,2),
+    status STRING, created_at TIMESTAMP, updated_at TIMESTAMP
+)
+USING iceberg
+PARTITIONED BY (days(created_at))
+TBLPROPERTIES (
+    'format-version' = '2',
+    'write.delete.mode' = 'merge-on-read',
+    'write.update.mode' = 'merge-on-read',
+    'write.merge.mode'  = 'merge-on-read',
+    'write.metadata.delete-after-commit.enabled' = 'true',
+    'write.metadata.previous-versions-max' = '50'
+)
+```
+
+### Partition transforms
+
+`days(created_at)` is a **partition transform**. Iceberg derives the partition value, here the date, from
+the column itself and records it in metadata.
+
+- **No extra column to maintain.** Hive-style partitioning would need a `created_date` column that every
+  writer fills in correctly.
+- **Pruning works on the real column.** `WHERE created_at >= '2026-10-30'` skips every older day without
+  the query mentioning a partition column.
+- **The layout can change later.** You can switch to `months(created_at)` without rewriting old data;
+  each file remembers the spec it was written with.
+
+The other transforms are `years`, `months`, `hours`, `bucket(N, col)` (hash into N buckets),
+`truncate(W, col)` and `identity`. The table partitions on `created_at` rather than `updated_at` because a
+row must never move between partitions.
+
+### Merge-on-read
+
+With the default **copy-on-write**, updating one row rewrites the whole data file that contains it. The
+generator updates random orders across all 30 days, so each sync would rewrite most of the table.
+**Merge-on-read** writes small *position-delete files* instead, which mark the old row versions as
+deleted. Readers apply them on the fly until the nightly compaction folds them back into the data files.
+
+That's why the commit log line has two delete numbers:
+
+```
+snapshot 4564330655857283829 (overwrite): +2716 records, position deletes +3451/-1510, total records in data files 105248
+```
+
+Iceberg keeps one delete file per data file. When a commit adds markers to a data file that already has
+some, it rewrites them all into a new delete file, so `-1510` are markers carried over and
+`3451 - 1510 = 1941` rows were actually updated. Of the 2,716 rows written, the other 775 were inserts.
+"Total records in data files" includes the hidden old versions, so it's larger than `count(*)` until
+compaction.
+
+## Staying distributed
+
+The main data path uses only DataFrame and SQL operations: no `.collect()`, no `.toPandas()`, no Python
+UDFs. Python UDFs would ship every row from the JVM to a Python worker and back. The explicit `select` and
+`cast` after the read are narrow transformations: each partition is processed where it is.
+
+Shuffles happen in two places, and both are commented in the code:
+
+1. **The MERGE join.** Source and target are joined on `id`. Spark either broadcasts the small source to
+   every executor and scans the target in place, or, for a big source, shuffles both sides by
+   `hash(id)` so matching ids meet in the same task. Adaptive Query Execution picks at runtime.
+2. **Write distribution.** Before writing, Iceberg repartitions the output by partition key
+   (`write.distribution-mode=hash`, the default for partitioned tables). Each task then writes one file per
+   day instead of every task writing a tiny file into every day.
+
+`spark.sql.shuffle.partitions` is set to 8 rather than the default 200, which is sized for big clusters.
+AQE coalesces those further when they turn out small.
+
+<Aside type="tip" title="See it in the Spark UI">
+While a run is going, open [localhost:4040](http://localhost:4040). Under **Stages**, the JDBC read has one
+task per slice spread across executors on both workers. Under **SQL**, the MERGE plan shows its
+`Exchange` (shuffle) nodes.
+</Aside>

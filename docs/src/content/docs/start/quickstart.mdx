@@ -1,0 +1,145 @@
+---
+title: Start the stack
+description: Bring up every service with Docker Compose and confirm they can reach each other.
+---
+
+import { Steps, Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+One `docker compose up` starts all fourteen containers. About ten minutes later the first sync has
+loaded the source table into Iceberg without you doing anything.
+
+## Prerequisites
+
+- **Docker with Compose v2.** Tested on Docker Engine 29.9 on Linux (amd64). Every image also publishes an
+  arm64 build, but Docker Desktop on macOS or Windows hasn't been tested.
+- **About 8 GB of RAM for Docker.** The two Spark workers get 2 GB each, the driver 1 GB, and Airflow and
+  the databases share the rest. On Docker Desktop, raise the memory limit under **Settings → Resources**.
+- **About 10 GB of free disk** for images, jars and volumes.
+
+<Aside type="tip" title="Laptop-sized on purpose">
+Each worker offers 2 cores and 2 GB, set by `SPARK_WORKER_CORES` and `SPARK_WORKER_MEMORY` in `.env`.
+Each executor takes 1 core and 1 GB, so the cluster runs at most four executors. If your machine is
+tight, lower the worker memory to `1g` and `spark.executor.memory` in `conf/spark-defaults.conf` to
+`512m`.
+</Aside>
+
+## Start it
+
+<Steps>
+
+1. **Linux only:** make the containers write `./logs` as your user instead of uid 50000.
+
+   ```sh
+   sed -i "s/^AIRFLOW_UID=.*/AIRFLOW_UID=$(id -u)/" .env
+   ```
+
+2. Build the two custom images and start everything.
+
+   ```sh
+   docker compose up -d --build
+   ```
+
+   The first build takes a few minutes: it pulls the Spark, Airflow, Postgres and RustFS images and
+   downloads the Iceberg and JDBC jars from Maven Central.
+
+3. Wait until the long-running services report `healthy`. The one-shot `airflow-init` and
+   `create-bucket` containers should show `Exited (0)`.
+
+   ```sh
+   docker compose ps
+   ```
+
+4. Open Airflow at [localhost:8080](http://localhost:8080). There's no login. The three DAGs are already
+   unpaused.
+
+5. Wait for the next ten-minute mark. The first `orders_sync` run notices that the Iceberg table doesn't
+   exist yet and **bootstraps it with a parallel full load**. Every run after that is incremental.
+
+</Steps>
+
+## Check that the pieces can reach each other
+
+Each of these talks to a different service over the shared Docker network:
+
+```sh
+# Source DB is seeded and the change generator is writing to it
+docker compose exec source-db psql -U shop -d shop \
+  -c "SELECT count(*), max(updated_at) FROM orders"
+
+# Both workers registered with the Spark master
+curl -s http://localhost:8090/json/ | python3 -m json.tool | grep -E '"(status|cores|host)"'
+
+# The Iceberg REST catalog answers
+curl -s http://localhost:8181/v1/config
+
+# The Spark connection was created from the environment variable
+docker compose exec airflow-scheduler airflow connections get spark_default
+```
+
+To test the whole chain (Spark, catalog and object storage) in one go, open a Spark SQL shell:
+
+```sh
+docker compose exec spark-master spark-sql
+```
+
+```sql
+SHOW NAMESPACES;      -- `sales` appears after the first sync
+```
+
+## Consoles
+
+| What | URL | Notes |
+| --- | --- | --- |
+| Airflow | [localhost:8080](http://localhost:8080) | No login (`SIMPLE_AUTH_MANAGER_ALL_ADMINS`) |
+| Spark master | [localhost:8090](http://localhost:8090) | Workers, running and finished applications |
+| Spark workers | [localhost:8081](http://localhost:8081), [localhost:8082](http://localhost:8082) | Executors and their logs |
+| Spark driver | [localhost:4040](http://localhost:4040) | Only while a job runs |
+| RustFS console | [localhost:9001/rustfs/console/](http://localhost:9001/rustfs/console/) | Log in with `S3_ACCESS_KEY` / `S3_SECRET_KEY` from `.env`. The bare `:9001` root returns a 403. |
+| Iceberg REST catalog | [localhost:8181/v1/config](http://localhost:8181/v1/config) | JSON only |
+| Source Postgres | `localhost:5433` | `psql -h localhost -p 5433 -U shop shop`, password `shop` |
+
+All host ports are set in `.env` if one of them clashes with something on your machine.
+
+## Stop and reset
+
+<Tabs>
+<TabItem label="Stop, keep data">
+
+```sh
+docker compose down
+```
+
+Named volumes survive: the source data, the Airflow history, the catalog and the warehouse bucket.
+`docker compose up -d` carries on where it stopped.
+
+</TabItem>
+<TabItem label="Reset everything">
+
+```sh
+docker compose down -v
+```
+
+`-v` deletes every volume. The next start re-seeds the source table, creates a fresh bucket and catalog,
+and the first sync bootstraps the Iceberg table again.
+
+</TabItem>
+<TabItem label="Pause the source">
+
+```sh
+docker compose stop change-generator    # freeze the source
+docker compose start change-generator   # resume
+```
+
+Useful when you want the Iceberg table to match the source exactly. See
+[Verify the sync](/data-eng-sandbox/operations/querying/#verify-the-sync-row-by-row).
+
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Downtime skips windows">
+The sync DAG uses `catchup=False`, so windows that close while the stack is stopped are never run. That
+includes the window you stopped in the middle of: stop at 08:05, restart at 09:00, and the changes made
+between 08:00 and 08:05 are never synced, because Airflow only runs the 08:50–09:00 window. After a
+restart, trigger `orders_full_load` once to catch up. It's an idempotent MERGE, so it's always safe. See
+[Airflow DAGs](/data-eng-sandbox/pipeline/dags/#catchup-and-gaps).
+</Aside>

@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- data-eng-sandbox ---------------------------------------------------------
+# The sandbox's .env holds only throwaway local credentials and is a required
+# part of the project, so it is committed on purpose (overrides `.env` above).
+!.env
+# Airflow task logs written by the containers.
+logs/

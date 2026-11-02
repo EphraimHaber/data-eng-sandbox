@@ -1,0 +1,391 @@
+# =============================================================================
+# Local data-engineering sandbox: Postgres -> Spark -> Iceberg, orchestrated by
+# Airflow.
+#
+#   source-db ──JDBC──▶ Spark executors ──S3 API──▶ RustFS (warehouse bucket)
+#                           ▲    │                        ▲
+#                 driver ───┘    └── table commits ──▶ iceberg-rest (catalog)
+#        (in airflow-scheduler)
+#
+# Every service joins ONE user-defined network (`sandbox`). Docker's embedded
+# DNS on that network resolves service names (spark-master, rustfs,
+# iceberg-rest, airflow-scheduler, ...), which is what lets executors on the
+# Spark workers connect back to the driver inside the Airflow container.
+#
+# All variables (${...}) come from .env.
+# =============================================================================
+
+name: ${COMPOSE_PROJECT_NAME:-desandbox}
+
+networks:
+  sandbox:
+    name: ${COMPOSE_PROJECT_NAME:-desandbox}
+
+volumes:
+  source-db-data:
+  airflow-db-data:
+  rustfs-data:
+  iceberg-catalog-data:
+
+# -----------------------------------------------------------------------------
+# Reusable fragments (YAML anchors). `<<: *name` merges a fragment in.
+# -----------------------------------------------------------------------------
+
+# S3 credentials for anything that runs Iceberg's S3FileIO: the REST catalog,
+# the Spark driver (Airflow) and the Spark executors (workers). The AWS SDK
+# reads these standard variable names automatically.
+x-s3-env: &s3-env
+  AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+  AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+  AWS_REGION: ${S3_REGION}
+
+x-spark-common: &spark-common
+  build:
+    context: ./docker/spark
+  image: ${COMPOSE_PROJECT_NAME:-desandbox}-spark:4.1.3
+  networks: [sandbox]
+  init: true   # tiny init process: reaps zombies and forwards signals to the JVM
+  environment:
+    <<: *s3-env
+  volumes:
+    - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+  restart: unless-stopped
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./docker/airflow
+  image: ${COMPOSE_PROJECT_NAME:-desandbox}-airflow:3.3.2
+  networks: [sandbox]
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment: &airflow-env
+    <<: *s3-env
+    # LocalExecutor: the scheduler runs tasks as local subprocesses. No Celery,
+    # no Redis, no workers - the simplest executor that still runs tasks in
+    # parallel. Consequence: every Spark driver runs in airflow-scheduler.
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # Airflow's OWN metadata database (DAG runs, task states, connections).
+    # Deliberately a separate Postgres from the source data.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-db:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # Start syncing as soon as the stack is up instead of waiting for you to
+    # unpause DAGs in the UI.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    # Airflow 3: task processes report state to the API server's Task Execution
+    # API instead of writing to the metadata DB directly; all components sign
+    # those calls with the same JWT secret.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__API_AUTH__JWT_ISSUER: airflow
+    # Local sandbox only: Airflow 3's built-in SimpleAuthManager, with every
+    # visitor treated as admin, so there is no login screen.
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # The Spark connection, defined as an environment variable instead of
+    # clicking it together in the UI. Airflow resolves conn_id "spark_default"
+    # from AIRFLOW_CONN_SPARK_DEFAULT (JSON form; a URI works too). The hook
+    # turns it into  --master spark://spark-master:7077 --deploy-mode client.
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark-master", "port": 7077, "extra": {"deploy-mode": "client", "spark-binary": "spark-submit"}}'
+    # Source DB settings for the Spark job. The job reads them from its
+    # environment (the driver inherits the task's environment) rather than from
+    # command-line arguments, so the password never shows up in `ps` or logs.
+    SOURCE_JDBC_URL: jdbc:postgresql://source-db:5432/${SOURCE_DB_NAME}
+    SOURCE_DB_USER: ${SOURCE_DB_USER}
+    SOURCE_DB_PASSWORD: ${SOURCE_DB_PASSWORD}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./jobs:/opt/airflow/jobs:ro
+    - ./logs:/opt/airflow/logs
+    - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+  restart: unless-stopped
+  depends_on: &airflow-depends-on
+    airflow-db:
+      condition: service_healthy
+
+services:
+  # ===========================================================================
+  # Source system
+  # ===========================================================================
+  source-db:
+    image: postgres:18.4
+    networks: [sandbox]
+    environment:
+      POSTGRES_USER: ${SOURCE_DB_USER}
+      POSTGRES_PASSWORD: ${SOURCE_DB_PASSWORD}
+      POSTGRES_DB: ${SOURCE_DB_NAME}
+    volumes:
+      # Postgres 18 images keep data under /var/lib/postgresql/<major>/...,
+      # so the volume is mounted one level up from the pre-18 ".../data".
+      - source-db-data:/var/lib/postgresql
+      # Seed scripts run once, on first start with an empty volume.
+      - ./source-db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${SOURCE_DB_HOST_PORT}:5432"
+    healthcheck:
+      # The seed insert runs before the "real" server starts accepting TCP
+      # connections, so -h forces a TCP check and waits for seeding to finish.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${SOURCE_DB_USER} -d ${SOURCE_DB_NAME}"]
+      interval: 5s
+      retries: 30
+    restart: unless-stopped
+
+  change-generator:
+    image: postgres:18.4   # reuse the postgres image just for psql
+    networks: [sandbox]
+    entrypoint: ["/bin/bash", "/scripts/generate_changes.sh"]
+    environment:
+      PGHOST: source-db
+      PGUSER: ${SOURCE_DB_USER}
+      PGPASSWORD: ${SOURCE_DB_PASSWORD}
+      PGDATABASE: ${SOURCE_DB_NAME}
+      CHANGE_INTERVAL_SECONDS: ${CHANGE_INTERVAL_SECONDS}
+      CHANGE_INSERTS: ${CHANGE_INSERTS}
+      CHANGE_UPDATES: ${CHANGE_UPDATES}
+    volumes:
+      - ./change-generator:/scripts:ro
+    depends_on:
+      source-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Storage: RustFS (S3-compatible object store) + Iceberg REST catalog
+  # ===========================================================================
+  rustfs:
+    image: rustfs/rustfs:1.0.4
+    networks: [sandbox]
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY}
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      # Web console (bucket browser, access keys, metrics) on its own port.
+      # It is served under /rustfs/console/; the bare root of :9001 returns 403.
+      # Open http://localhost:9001/rustfs/console/ and log in with the S3 keys.
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_REGION: ${S3_REGION}
+    volumes:
+      - rustfs-data:/data
+    ports:
+      - "${RUSTFS_API_HOST_PORT}:9000"       # S3 API
+      - "${RUSTFS_CONSOLE_HOST_PORT}:9001"   # web console -> /rustfs/console/
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/health"]
+      interval: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # One-shot job: create the warehouse bucket, then exit. Idempotent, so it is
+  # safe on every `docker compose up`. RustFS has no "create bucket on boot"
+  # setting, so we use the standard AWS CLI pointed at RustFS.
+  create-bucket:
+    image: amazon/aws-cli:2.38.0
+    networks: [sandbox]
+    environment:
+      <<: *s3-env
+      AWS_ENDPOINT_URL_S3: http://rustfs:9000
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if aws s3api head-bucket --bucket "${WAREHOUSE_BUCKET}" 2>/dev/null; then
+          echo "bucket s3://${WAREHOUSE_BUCKET} already exists"
+        else
+          aws s3api create-bucket --bucket "${WAREHOUSE_BUCKET}"
+          echo "created bucket s3://${WAREHOUSE_BUCKET}"
+        fi
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    restart: "no"
+
+  # Iceberg REST catalog. This is the reference server published by the Apache
+  # Iceberg project ("rest-fixture"): a thin REST layer over Iceberg's JDBC
+  # catalog, here backed by a SQLite file on a volume. It is meant for testing
+  # and learning; production setups use Apache Polaris, Lakekeeper, Nessie,
+  # Unity Catalog, AWS Glue, etc. - all speak the same REST protocol, so the
+  # Spark config would barely change.
+  #
+  # The server needs S3 access too: on every commit IT writes the new
+  # metadata.json into the warehouse, then swaps the table's pointer.
+  # Env vars named CATALOG_* become catalog properties:
+  # strip "CATALOG_", "__" -> "-", "_" -> ".", lowercase.
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.10.1
+    networks: [sandbox]
+    environment:
+      <<: *s3-env
+      CATALOG_WAREHOUSE: s3://${WAREHOUSE_BUCKET}/
+      CATALOG_URI: jdbc:sqlite:/home/iceberg/iceberg_catalog.db   # persisted on a volume
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO       # -> io-impl
+      CATALOG_S3_ENDPOINT: http://rustfs:9000                    # -> s3.endpoint
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"                     # -> s3.path-style-access
+    volumes:
+      - iceberg-catalog-data:/home/iceberg
+    ports:
+      - "${ICEBERG_REST_HOST_PORT}:8181"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8181/v1/config"]
+      interval: 5s
+      retries: 30
+    depends_on:
+      create-bucket:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Spark standalone cluster: 1 master + 2 workers
+  # ===========================================================================
+  # The master only does bookkeeping: workers register with it, and it tells
+  # them to launch executors for each application. No data flows through it.
+  spark-master:
+    <<: *spark-common
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master",
+              "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "${SPARK_MASTER_UI_HOST_PORT}:8080"   # master web UI
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080')"]
+      interval: 5s
+      retries: 30
+
+  # Workers run the executors: the JVMs that actually read from Postgres,
+  # shuffle, and write Parquet files to RustFS.
+  spark-worker-1:
+    <<: *spark-common
+    hostname: spark-worker-1
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "--host", "spark-worker-1", "--webui-port", "8081", "spark://spark-master:7077"]
+    environment:
+      <<: *s3-env
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY}
+    ports:
+      - "8081:8081"   # worker web UI
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081')"]
+      interval: 5s
+      retries: 30
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  spark-worker-2:
+    <<: *spark-common
+    hostname: spark-worker-2
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "--host", "spark-worker-2", "--webui-port", "8081", "spark://spark-master:7077"]
+    environment:
+      <<: *s3-env
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY}
+    ports:
+      - "8082:8081"   # worker web UI
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081')"]
+      interval: 5s
+      retries: 30
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Airflow (LocalExecutor)
+  # ===========================================================================
+  airflow-db:
+    image: postgres:18.4
+    networks: [sandbox]
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+    volumes:
+      - airflow-db-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${AIRFLOW_DB_USER} -d ${AIRFLOW_DB_NAME}"]
+      interval: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # One-shot: migrate the metadata DB, create the pool, fix log dir ownership.
+  airflow-init:
+    <<: *airflow-common
+    user: "0:0"   # root, only so it can chown the bind-mounted logs directory
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        # Create/upgrade Airflow's tables in the metadata DB.
+        /entrypoint airflow db migrate
+        # A pool with ONE slot. The sync, full-load and maintenance tasks all
+        # write to the same Iceberg table; running them one at a time avoids
+        # commit conflicts and keeps the 4-core cluster from being oversubscribed.
+        /entrypoint airflow pools set iceberg_orders 1 "Serialize Spark jobs that write lake.sales.orders"
+        # Bind-mounted ./logs must be writable by the (non-root) Airflow user.
+        mkdir -p /opt/airflow/logs
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    hostname: airflow-apiserver
+    command: api-server   # serves the UI, the REST API and the Task Execution API
+    ports:
+      - "${AIRFLOW_HOST_PORT}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Decides WHAT runs WHEN and, with LocalExecutor, also RUNS the tasks.
+  # => spark-submit and therefore every Spark driver live in this container.
+  airflow-scheduler:
+    <<: *airflow-common
+    # A fixed hostname: executors connect back to the driver at
+    # spark.driver.host=airflow-scheduler (set in dags/common.py).
+    hostname: airflow-scheduler
+    command: scheduler
+    ports:
+      - "4040:4040"   # Spark driver UI of the currently running job
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8974/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-apiserver:
+        condition: service_healthy
+
+  # Airflow 3 always runs DAG-file parsing in a separate process/service.
+  airflow-dag-processor:
+    <<: *airflow-common
+    hostname: airflow-dag-processor
+    command: dag-processor
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Runs deferrable operators/sensors (async waits that free a worker slot).
+  # Our DAGs don't use any, but it's part of a standard Airflow deployment.
+  airflow-triggerer:
+    <<: *airflow-common
+    hostname: airflow-triggerer
+    command: triggerer
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
