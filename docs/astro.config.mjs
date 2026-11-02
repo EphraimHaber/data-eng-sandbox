@@ -30,7 +30,7 @@ export default defineConfig({
 			favicon: '/favicon.svg',
 			social: [{ icon: 'github', label: 'Source on GitHub', href: REPO }],
 			editLink: {
-				baseUrl: `${REPO}/edit/main/docs/`,
+				baseUrl: `${REPO}/edit/master/docs/`,
 			},
 			// Reads each page's last commit date. The deploy workflow checks out the
 			// full history (fetch-depth: 0) so the date is real, not the CI clone time.
@@ -56,7 +56,9 @@ export default defineConfig({
 			},
 			// Fails the build on broken internal links or missing #anchors, so a
 			// renamed page can't silently break the published site.
-			plugins: [starlightLinksValidator()],
+			// errorOnLocalLinks: false - the pages link to http://localhost:8080 and
+			// friends on purpose: they're the consoles of the stack you run locally.
+			plugins: [starlightLinksValidator({ errorOnLocalLinks: false })],
 			sidebar: [
 				{
 					label: 'Start here',

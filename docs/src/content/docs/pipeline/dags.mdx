@@ -1,0 +1,166 @@
+---
+title: Airflow DAGs
+description: The sync, full-load and maintenance DAGs and how they submit work to Spark.
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Three DAGs live in `dags/`. All of them are a single `SparkSubmitOperator` per task. The work happens in a
+Spark application rather than in Python inside Airflow, so classic operators read more clearly here
+than TaskFlow would.
+
+| DAG | Schedule | What it does |
+| --- | --- | --- |
+| `orders_sync` | Every 10 minutes | MERGEs the rows that changed during the run's data interval |
+| `orders_full_load` | Manual only | Reads the whole source table in parallel and MERGEs it |
+| `iceberg_maintenance` | Daily, 03:17 UTC | Compaction, manifest rewrite, snapshot expiry, orphan removal. See [Table maintenance](/data-eng-sandbox/operations/maintenance/). |
+
+## The ten-minute sync
+
+```python
+SCHEDULE = CronDataIntervalTimetable("*/10 * * * *", timezone="UTC")
+
+with DAG(
+    dag_id="orders_sync",
+    schedule=SCHEDULE,
+    start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    catchup=False,
+    max_active_runs=1,
+    default_args=DEFAULT_ARGS,
+    user_defined_macros={"window_bound": window_bound},
+) as dag:
+    SparkSubmitOperator(
+        task_id="merge_changed_orders",
+        conn_id="spark_default",
+        application="/opt/airflow/jobs/sync_orders.py",
+        conf=SPARK_DRIVER_CONF,
+        application_args=[
+            "--mode", "incremental",
+            "--start", "{{ window_bound(dag_run, 'start') }}",
+            "--end", "{{ window_bound(dag_run, 'end') }}",
+            "--table", "lake.sales.orders",
+        ],
+        pool="iceberg_orders",
+    )
+```
+
+### Why `CronDataIntervalTimetable`
+
+In Airflow 3, `schedule="*/10 * * * *"` means **`CronTriggerTimetable`**. Runs fire every ten minutes, but
+each run's `data_interval_start` equals its `data_interval_end`: a zero-length window that would never
+match a row. `CronDataIntervalTimetable` gives each run the interval from the previous tick to this one.
+The run that starts at 06:50 covers 06:40–06:50.
+
+### Manual runs and `window_bound`
+
+In Airflow 3, a manual run may have **no logical date** and therefore no data interval. That's the
+default for `airflow dags trigger`, and for the UI's trigger form when the date is left empty. A template
+that uses `{{ data_interval_start }}` directly then fails while rendering, and the task fails on every
+retry.
+
+`window_bound()` uses the run's data interval when there is one. When there isn't, it falls back to the
+**latest complete interval**, the same window Airflow infers when you pass a logical date of "now":
+
+| How you trigger | Window synced |
+| --- | --- |
+| Scheduled | The interval that just closed |
+| `airflow dags trigger orders_sync` at 07:28 | 07:10–07:20 |
+| `airflow dags trigger orders_sync -l 2026-11-02T07:15:00+00:00` | The latest complete interval as of 07:15: 07:00–07:10 |
+| UI form with a data interval filled in | Exactly that interval |
+
+The latest complete window has normally been synced already, so a plain manual trigger is a cheap way to
+watch idempotency at work: it reads a few thousand rows and writes none.
+
+### `catchup` and gaps
+
+`catchup=False` means that when the DAG is enabled, or Airflow comes back after downtime, it runs only the
+most recent interval instead of one run for every ten minutes since `start_date`. The trade-off is that
+**intervals that never ran are skipped**, and their changes stay unsynced until those rows change again.
+
+Ways to close a gap, from simplest to most automatic:
+
+1. **Trigger `orders_full_load`.** It's a MERGE, so it only writes rows that differ and is safe at any time.
+2. **Set `catchup=True`.** Airflow creates a run for every missed interval and works through them in order.
+   `max_active_runs=1` keeps them sequential.
+3. **Start from the last success** by passing `{{ prev_data_interval_end_success }}` (falling back to the
+   interval start) as `--start`. Each run then covers everything since the previous *successful* run, at
+   the cost of windows that are no longer a fixed size.
+
+### `max_active_runs=1`
+
+There's never more than one sync in flight. Two concurrent MERGEs into the same table would conflict at
+commit time, and in-order runs keep the snapshot history easy to read.
+
+## The initial full load
+
+The first incremental run creates the table with a full load when it doesn't exist yet, so a fresh stack
+needs no manual step. `orders_full_load` exists for the other cases: reloading on purpose, or repairing
+gaps.
+
+```python
+SparkSubmitOperator(
+    task_id="full_load_orders",
+    application="/opt/airflow/jobs/sync_orders.py",
+    application_args=["--mode", "full", "--table", "lake.sales.orders"],
+    pool="iceberg_orders",
+    ...
+)
+```
+
+A full load reads all ~100k rows in 8 parallel slices. On an empty table it's an "append" snapshot. On a
+populated table the MERGE guard skips every row that hasn't changed. In testing, a full load over 101,010
+rows wrote only the 307 that were out of date.
+
+## The Spark connection
+
+There's no clicking in **Admin → Connections**. Airflow resolves any connection id from an environment
+variable named `AIRFLOW_CONN_<ID>`, and `docker-compose.yml` sets one on every Airflow container:
+
+```yaml
+AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark-master", "port": 7077,
+                              "extra": {"deploy-mode": "client", "spark-binary": "spark-submit"}}'
+```
+
+The Spark provider turns that into `--master spark://spark-master:7077 --deploy-mode client`. JSON is
+easier to read than the URI form (`spark://spark-master:7077?deploy-mode=client`), which also works.
+Connections defined this way don't appear in the UI's connection list, but
+`airflow connections get spark_default` shows them.
+
+Everything else comes from two places:
+
+- **`conf/spark-defaults.conf`:** the Iceberg catalog, jars, executor sizes. It's shared with the cluster.
+- **`SPARK_DRIVER_CONF` in `dags/sandbox_common.py`:** `spark.driver.host`, `spark.driver.bindAddress` and
+  the fixed driver ports. These depend on where the task runs, so they belong with the DAGs. See
+  [Pitfalls](/data-eng-sandbox/reference/pitfalls/#the-driver-lives-in-the-airflow-container).
+
+The source database credentials reach the job as environment variables (`SOURCE_JDBC_URL`,
+`SOURCE_DB_USER`, `SOURCE_DB_PASSWORD`). The driver inherits the task's environment, so the password never
+appears on the `spark-submit` command line or in the task log.
+
+## Retries, timeouts and the pool
+
+```python
+DEFAULT_ARGS = {
+    "retries": 2,
+    "retry_delay": timedelta(minutes=1),
+    "retry_exponential_backoff": True,
+    "execution_timeout": timedelta(minutes=30),
+}
+```
+
+- **Retries are always safe** because every job is idempotent. Typical transient failures are a worker
+  restarting, a commit conflict with a concurrent writer, or Postgres being briefly unavailable.
+- **`execution_timeout`** fails a stuck run. With `max_active_runs=1`, a sync that hung forever would
+  otherwise block every later run.
+- **The `iceberg_orders` pool has one slot.** `airflow-init` creates it. The sync, the full load and every
+  maintenance task use it, so only one Spark job writes to the table at a time, and the 4-core cluster is
+  never asked to run two applications at once. The pool serializes *tasks*, not DAG runs, so a sync can
+  slot in between two maintenance tasks. That's harmless because each step commits atomically.
+
+<Aside type="note" title="Unpaused on creation">
+`AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=false`, so syncing starts as soon as the stack is up. On the
+very first start, `iceberg_maintenance` also runs once for the most recent 03:17 slot. The table doesn't
+exist yet, so it's a no-op.
+</Aside>

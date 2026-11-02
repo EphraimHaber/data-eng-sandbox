@@ -1,0 +1,135 @@
+---
+title: What runs where
+description: Which container runs each process, and how they talk on the Docker network.
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+The stack is fourteen containers on one Docker network. Knowing which process runs in which container
+is most of what it takes to debug it.
+
+```
+ change-generator
+       │ INSERT / UPDATE every 5 s
+       ▼
+ source-db ◀────── JDBC: one connection per read task ──────┐
+                                                            │
+ airflow-scheduler ── spark-submit ──▶ spark-master         │
+ (Spark driver)                             │ launch        │
+       ▲                                    ▼ executors     │
+       ├────── executors connect back ── spark-worker-1/2 ──┘
+       │                                    │
+       │ load table, commit                 │ data + delete files
+       ▼                                    ▼
+ iceberg-rest ──── metadata.json ────▶ rustfs  s3://warehouse
+```
+
+## The services
+
+| Container | What runs in it | Notes |
+| --- | --- | --- |
+| `source-db` | Postgres 18 with the `orders` table | The "production" system: about 100k seeded rows, a trigger that bumps `updated_at` on every update, and an index on `updated_at`. |
+| `change-generator` | A `psql` loop in a stock Postgres image | Every 5 seconds: 10 inserts and 25 updates in one transaction. Never deletes. |
+| `airflow-db` | Postgres 18 for **Airflow's own** metadata | DAG runs, task states, pools. Kept apart from the source data on purpose. |
+| `airflow-init` | One-shot: `airflow db migrate`, creates the `iceberg_orders` pool | Exits when done. Every other Airflow service waits for it. |
+| `airflow-apiserver` | Airflow 3's UI, REST API and Task Execution API | Task processes report their state here instead of writing to the database directly. |
+| `airflow-scheduler` | The scheduler, **and every task process** (LocalExecutor) | So every `spark-submit`, and therefore every Spark driver, runs here. |
+| `airflow-dag-processor` | Parses the files in `dags/` | A separate component in Airflow 3. |
+| `airflow-triggerer` | Runs deferrable tasks | Unused by these DAGs, but part of a standard deployment. |
+| `spark-master` | Spark standalone master | Bookkeeping only. It tracks workers and assigns executors; no data passes through it. |
+| `spark-worker-1`, `spark-worker-2` | Spark workers, 2 cores and 2 GB each | They start the **executors**, the JVMs that read Postgres, shuffle and write Parquet. |
+| `iceberg-rest` | Iceberg REST catalog (the project's reference server) | Maps each table name to its current `metadata.json`. Its own state is a SQLite file on a volume. |
+| `rustfs` | S3-compatible object storage | Holds the warehouse: data files, delete files, manifests and metadata. |
+| `create-bucket` | One-shot AWS CLI | Creates `s3://warehouse` if it doesn't exist, then exits. |
+
+## Life of a sync run
+
+<Steps>
+
+1. At 06:50 the **scheduler** sees that the 06:40–06:50 interval has closed and creates an `orders_sync`
+   run.
+
+2. With the LocalExecutor, the scheduler forks a task process **in its own container**.
+   `SparkSubmitOperator` runs:
+
+   ```sh
+   spark-submit --master spark://spark-master:7077 --deploy-mode client \
+     --conf spark.driver.host=airflow-scheduler ... \
+     /opt/airflow/jobs/sync_orders.py --mode incremental \
+     --start 2026-11-02T06:40:00+00:00 --end 2026-11-02T06:50:00+00:00
+   ```
+
+3. `spark-submit` starts the **driver**: a JVM plus the Python process running `sync_orders.py`, still
+   inside `airflow-scheduler`. The driver registers with the master, and the master tells both workers to
+   launch executors.
+
+4. The executors connect **back to the driver** at `airflow-scheduler:7078` to receive tasks.
+
+5. The driver asks Postgres for `min(id)`, `max(id)` and `count(*)` of the window, then plans one JDBC
+   read per id slice. Each executor task opens its **own** connection to `source-db`.
+
+6. Executors join the changed rows to the Iceberg table and write new Parquet and delete files
+   **directly to RustFS**.
+
+7. The driver commits through `iceberg-rest`. The catalog writes a new `metadata.json` and swaps the
+   table's pointer to it. That single pointer swap is what makes the commit all-or-nothing.
+
+</Steps>
+
+## Why the driver runs in the Airflow container
+
+Spark has two deploy modes. In **cluster** mode the driver runs on a worker. In **client** mode it's the
+process that called `spark-submit`. On a standalone cluster, Python applications only support client
+mode, so the driver is wherever the Airflow task runs. With the LocalExecutor that's
+`airflow-scheduler`.
+
+That has three consequences:
+
+- **The Airflow image is a Spark client.** It carries the same Java 17, the same Spark 4.1.3 build, the
+  same jars and the same Python minor version as the cluster. See
+  [Pinned versions](/data-eng-sandbox/reference/versions/).
+- **Executors must be able to reach the driver.** The driver advertises `spark.driver.host=airflow-scheduler`
+  and listens on `0.0.0.0`. See
+  [Pitfalls](/data-eng-sandbox/reference/pitfalls/#the-driver-lives-in-the-airflow-container).
+- **The driver's memory comes out of the scheduler container.** A job that pulled data back to the driver
+  with `.collect()` would compete with Airflow itself, which is one more reason the job never does.
+
+<Aside title="Changing the executor">
+With the Celery or Kubernetes executor, tasks run in worker containers or pods, so the driver moves too
+and `spark.driver.host` in `dags/sandbox_common.py` has to follow it.
+</Aside>
+
+## Network, hostnames and ports
+
+Every service joins a single user-defined network called `desandbox`. Docker's embedded DNS resolves
+service names on it, so `spark-master`, `rustfs`, `iceberg-rest` and `airflow-scheduler` work as
+hostnames from any container. The Spark and Airflow containers also set `hostname:` to their service
+name, so the names Spark writes into its own UI links resolve as well.
+
+| Port (in network) | Service | Published on host | Used by |
+| --- | --- | --- | --- |
+| `5432` | `source-db` | `5433` | Executors (JDBC), the driver (bounds query), the change generator |
+| `5432` | `airflow-db` | not published | Airflow components |
+| `7077` | `spark-master` | not published | Driver (registers the app), workers (register themselves) |
+| `8080` | `spark-master` web UI | `8090` | You |
+| `8081` | worker web UIs | `8081`, `8082` | You |
+| `7078` | driver RPC in `airflow-scheduler` | not published | Executors connecting back to the driver |
+| `7079` | driver block manager | not published | Executors fetching blocks from the driver |
+| `4040` | driver web UI | `4040` | You, while a job runs |
+| `8080` | `airflow-apiserver` | `8080` | You, and Airflow task processes (Task Execution API) |
+| `8181` | `iceberg-rest` | `8181` | Driver (table loads and commits) |
+| `9000` | `rustfs` S3 API | `9000` | Driver, executors, catalog, `create-bucket` |
+| `9001` | `rustfs` console | `9001` | You |
+
+Inside the network, every container can reach every port, and the "published" column only matters from
+your laptop. The driver ports are fixed rather than random so the traffic is easy to follow, and so
+they'd be easy to open in a firewall if executors ever ran elsewhere.
+
+## Configuration in one place
+
+| File | What it holds |
+| --- | --- |
+| `.env` | Ports, credentials, worker sizes, change-generator rates |
+| `conf/spark-defaults.conf` | Iceberg catalog, jars on the classpath, executor sizes. Mounted into **every** Spark and Airflow container, so a hand-run `spark-sql` sees the same tables as the scheduled jobs. |
+| `dags/sandbox_common.py` | Driver networking, retries, the pool name |
+| `docker-compose.yml` | Services, the network, healthchecks, start-up order, S3 credentials as `AWS_*` variables |

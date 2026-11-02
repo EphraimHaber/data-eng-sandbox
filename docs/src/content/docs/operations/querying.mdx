@@ -1,0 +1,178 @@
+---
+title: Query and time travel
+description: Inspect the Iceberg table, list its snapshots, query an earlier one, and check it against the source.
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Every query on this page runs in a Spark SQL shell:
+
+```sh
+docker compose exec spark-master spark-sql
+```
+
+The shell reads the same `conf/spark-defaults.conf` as the scheduled jobs, and `lake` is the default
+catalog, so `sales.orders` means `lake.sales.orders`. Timestamps are shown and parsed in UTC.
+
+<Aside type="tip">
+A one-off query works too:
+`docker compose exec spark-master spark-sql -e "SELECT count(*) FROM sales.orders"`.
+</Aside>
+
+## Query the table
+
+```sql
+SELECT count(*), count(DISTINCT id), max(updated_at) FROM sales.orders;
+
+SELECT status, count(*) AS orders, sum(amount) AS revenue
+FROM sales.orders
+GROUP BY status
+ORDER BY orders DESC;
+```
+
+`max(updated_at)` tells you how fresh the table is. It should be within the last ten-minute window, plus
+the time the sync takes.
+
+Partition pruning comes for free with `days(created_at)`. This query only opens the files for the last two
+days:
+
+```sql
+SELECT count(*) FROM sales.orders
+WHERE created_at >= current_timestamp() - INTERVAL 2 DAYS;
+```
+
+## List snapshots
+
+Every successful sync commits one snapshot.
+
+```sql
+SELECT committed_at, snapshot_id, operation,
+       summary['added-records']          AS added,
+       summary['added-position-deletes'] AS deletes
+FROM sales.orders.snapshots
+ORDER BY committed_at;
+```
+
+```
+2026-11-02 07:08:26.223  4354245633948515157  append     100410  NULL
+2026-11-02 07:10:53.015  5846096028921675520  overwrite  734     524
+2026-11-02 07:20:57.04   5243452072317170427  overwrite  1081    1295
+```
+
+- `append` is the initial full load.
+- `overwrite` is a MERGE.
+- `replace` is a compaction or manifest rewrite. It rewrites files but leaves the data unchanged.
+
+`history` shows which snapshot was current when. It differs from `snapshots` after a rollback:
+
+```sql
+SELECT * FROM sales.orders.history;
+```
+
+## Time travel
+
+Replace `<snapshot_id>` with an id from the list above.
+
+```sql
+-- the table as of a snapshot, e.g. right after the initial full load
+SELECT count(*) FROM sales.orders VERSION AS OF <snapshot_id>;
+
+-- the table as of a moment in time (UTC): whichever snapshot was current then
+SELECT count(*) FROM sales.orders TIMESTAMP AS OF '2026-11-02 07:09:00';
+
+-- what changed between that snapshot and now?
+SELECT id, status, updated_at FROM sales.orders
+EXCEPT
+SELECT id, status, updated_at FROM sales.orders VERSION AS OF <snapshot_id>
+LIMIT 20;
+
+-- how many of each status changed since then?
+SELECT now.status, count(*)
+FROM sales.orders AS now
+JOIN sales.orders VERSION AS OF <snapshot_id> AS before ON now.id = before.id
+WHERE now.status <> before.status
+GROUP BY now.status;
+```
+
+From PySpark, the DataFrame API uses Spark's built-in time-travel options:
+
+```python
+spark.read.option("versionAsOf", 4354245633948515157).table("sales.orders")
+spark.read.option("timestampAsOf", "2026-11-02 07:09:00").table("sales.orders")
+```
+
+Older tutorials use Iceberg's own `snapshot-id` and `as-of-timestamp` options. Iceberg 1.12 rejects them
+with *"Time travel option `snapshot-id` is no longer supported, use Spark built-in `versionAsOf`
+instead"*.
+
+Time travel only reaches back as far as the oldest snapshot that maintenance hasn't expired: about 24 hours
+here, and always at least the last 10 snapshots.
+
+<Aside type="note" title="Undo a bad sync">
+Because every snapshot is still there, a bad commit can be undone instantly, with no data copied:
+`CALL lake.system.rollback_to_snapshot('lake.sales.orders', <snapshot_id>)`. The next sync carries on from
+there. Rows from the rolled-back window come back with the next full load, or the next time they change.
+</Aside>
+
+## Look under the hood
+
+Iceberg exposes its metadata as tables, so you can query how the table is stored:
+
+```sql
+-- data files (content = 0) and position-delete files (content = 1)
+SELECT content, count(*) AS files, sum(record_count) AS records
+FROM sales.orders.files GROUP BY content;
+
+-- per file: partition, rows, size and where it lives
+SELECT partition, record_count, file_size_in_bytes, file_path
+FROM sales.orders.files LIMIT 10;
+
+-- per partition: rows, files, delete files, last update
+SELECT * FROM sales.orders.partitions ORDER BY partition DESC LIMIT 5;
+
+-- manifests, the index files that query planning reads first
+SELECT path, added_data_files_count, existing_data_files_count FROM sales.orders.manifests;
+
+-- which old row versions each delete file hides
+SELECT file_path, pos FROM sales.orders.position_deletes LIMIT 10;
+```
+
+Run the `files` query before and after
+[maintenance](/data-eng-sandbox/operations/maintenance/) to watch compaction work.
+
+The objects themselves are in the RustFS console at [localhost:9001](http://localhost:9001), bucket
+`warehouse`, or from the command line:
+
+```sh
+docker compose run --rm create-bucket "aws s3 ls --recursive s3://warehouse/sales/orders/ | head"
+```
+
+## Verify the sync row by row
+
+`jobs/verify_sync.py` reads the source and the Iceberg table in parallel and compares them with distributed
+set operations. Only counts and a few sample ids come back to the driver.
+
+```sh
+docker compose stop change-generator      # freeze the source
+# wait for the next orders_sync run to succeed (or trigger one), then:
+docker compose exec airflow-scheduler spark-submit \
+  --conf spark.driver.host=airflow-scheduler /opt/airflow/jobs/verify_sync.py
+docker compose start change-generator
+```
+
+```
+=== verify_sync ===
+source rows                               100930
+iceberg rows                              100930
+ids missing from iceberg                  0
+ids only in iceberg (deleted in source?)  0
+duplicate ids in iceberg                  0
+rows that differ (source side)            0
+rows that differ (iceberg side)           0
+RESULT: IDENTICAL
+```
+
+With the generator still running you'll see `DIFFERENT`, and that's expected: the source has moved on
+since the last sync. The counts tell you how far behind the table is.

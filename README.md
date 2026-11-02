@@ -1,5 +1,7 @@
 # Data-engineering sandbox: Postgres → Spark → Iceberg, orchestrated by Airflow
 
+📖 **Docs site:** <https://ephraimhaber.github.io/data-eng-sandbox/> (source in [`docs/`](docs/)).
+
 A local, laptop-sized stack for learning how these tools fit together. A Postgres
 `orders` table keeps changing. Every 10 minutes Airflow starts a Spark job that reads
 the rows that changed, in parallel, and upserts them into an Apache Iceberg table
@@ -321,8 +323,10 @@ EXCEPT
 SELECT id, status, updated_at FROM sales.orders VERSION AS OF <snapshot_id>
 LIMIT 20;
 
--- the same thing via the DataFrame API (pyspark shell):
---   spark.read.option("snapshot-id", <snapshot_id>).table("sales.orders")
+-- the same thing via the DataFrame API (pyspark shell). Iceberg 1.12 removed its own
+-- `snapshot-id` / `as-of-timestamp` options in favour of Spark's built-in ones:
+--   spark.read.option("versionAsOf", <snapshot_id>).table("sales.orders")
+--   spark.read.option("timestampAsOf", "2026-11-02 07:09:00").table("sales.orders")
 ```
 
 Time travel only reaches back as far as the oldest snapshot not yet expired by maintenance (~24 h here).

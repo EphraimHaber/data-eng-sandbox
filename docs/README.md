@@ -62,12 +62,14 @@ docs/
 - Images go in `src/assets/` and are referenced relatively, so Astro can
   optimise them.
 
-The placeholder pages each list what they're meant to cover. Replace the
-`:::note[Not written yet]` block when you write the page.
+Pages describe the code in the rest of the repository, so update them in the
+same commit when you change a DAG, the job or `docker-compose.yml`. Numbers
+quoted on the pages (row counts, file counts, log lines) come from real runs
+of the sandbox, so re-run before changing them.
 
 ## Publishing to GitHub Pages
 
-`.github/workflows/docs.yml` builds the site on every push to `main` that
+`.github/workflows/docs.yml` builds the site on every push to `master` that
 touches `docs/`, and deploys it with the official
 [`withastro/action`](https://github.com/withastro/action) and
 `actions/deploy-pages`. Pull requests run the same type check and build, but
