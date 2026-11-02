@@ -119,7 +119,7 @@ name, so the names Spark writes into its own UI links resolve as well.
 | `8080` | `airflow-apiserver` | `8080` | You, and Airflow task processes (Task Execution API) |
 | `8181` | `iceberg-rest` | `8181` | Driver (table loads and commits) |
 | `9000` | `rustfs` S3 API | `9000` | Driver, executors, catalog, `create-bucket` |
-| `9001` | `rustfs` console | `9001` | You |
+| `9001` | `rustfs` web console (`/rustfs/console/`) | `9001` | You |
 
 Inside the network, every container can reach every port, and the "published" column only matters from
 your laptop. The driver ports are fixed rather than random so the traffic is easy to follow, and so

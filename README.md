@@ -62,7 +62,7 @@ docker compose up -d --build     # then open http://localhost:8080
 | `spark-master` | Spark standalone master | Bookkeeping only: tracks workers, assigns executors. No data passes through it. UI: http://localhost:8090 |
 | `spark-worker-1/2` | Spark workers, 2 cores / 2 GB each | Launch the **executors** that read Postgres, shuffle and write Parquet. UIs: :8081, :8082 |
 | `iceberg-rest` | Iceberg REST catalog (reference implementation) | Maps table names to their current `metadata.json`. Its own state is a SQLite file on a volume. |
-| `rustfs` | S3-compatible object store | Holds the Iceberg warehouse: data files, delete files, manifests, metadata. Console: http://localhost:9001 |
+| `rustfs` | S3-compatible object store | Holds the Iceberg warehouse: data files, delete files, manifests, metadata. Console: http://localhost:9001/rustfs/console/ |
 | `create-bucket` | One-shot AWS CLI: creates `s3://warehouse` | Idempotent; exits when done. |
 
 How a sync run flows:
@@ -127,7 +127,7 @@ docker compose ps                 # wait until the services report "healthy"
 | Spark master | http://localhost:8090 |
 | Spark workers | http://localhost:8081, http://localhost:8082 |
 | Spark driver (only while a job runs) | http://localhost:4040 |
-| RustFS console | http://localhost:9001 (user/password: `S3_ACCESS_KEY` / `S3_SECRET_KEY` from `.env`) |
+| RustFS console | http://localhost:9001/rustfs/console/ (log in with `S3_ACCESS_KEY` / `S3_SECRET_KEY` from `.env`; the bare `:9001` root returns a 403) |
 | Iceberg REST catalog | http://localhost:8181/v1/config |
 | Source Postgres | `psql -h localhost -p 5433 -U shop shop` (password `shop`) |
 
@@ -340,7 +340,7 @@ SELECT * FROM sales.orders.partitions ORDER BY partition DESC LIMIT 5;
 SELECT * FROM sales.orders.manifests;
 ```
 
-The files themselves are visible in the RustFS console (http://localhost:9001, bucket `warehouse`) or with:
+The files themselves are visible in the RustFS console (http://localhost:9001/rustfs/console/, bucket `warehouse`) or with:
 ```bash
 docker compose run --rm create-bucket "aws s3 ls --recursive s3://warehouse/sales/orders/ | head"
 ```

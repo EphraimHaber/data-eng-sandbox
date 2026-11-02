@@ -159,6 +159,9 @@ services:
       RUSTFS_SECRET_KEY: ${S3_SECRET_KEY}
       RUSTFS_VOLUMES: /data
       RUSTFS_ADDRESS: ":9000"
+      # Web console (bucket browser, access keys, metrics) on its own port.
+      # It is served under /rustfs/console/; the bare root of :9001 returns 403.
+      # Open http://localhost:9001/rustfs/console/ and log in with the S3 keys.
       RUSTFS_CONSOLE_ENABLE: "true"
       RUSTFS_CONSOLE_ADDRESS: ":9001"
       RUSTFS_REGION: ${S3_REGION}
@@ -166,7 +169,7 @@ services:
       - rustfs-data:/data
     ports:
       - "${RUSTFS_API_HOST_PORT}:9000"       # S3 API
-      - "${RUSTFS_CONSOLE_HOST_PORT}:9001"   # web console
+      - "${RUSTFS_CONSOLE_HOST_PORT}:9001"   # web console -> /rustfs/console/
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9000/health"]
       interval: 5s

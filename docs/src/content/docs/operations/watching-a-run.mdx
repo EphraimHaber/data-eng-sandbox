@@ -67,7 +67,7 @@ Running the same command twice is the quickest idempotency test: the second run 
 | **Spark master**, [localhost:8090](http://localhost:8090) | The running application, its 4 cores and which workers host its executors. |
 | **Spark driver**, [localhost:4040](http://localhost:4040) | **Jobs/Stages:** the JDBC read stage has one task per slice. **SQL:** the MERGE plan and its `Exchange` nodes (shuffles). **Executors:** the four executors plus the driver. Only available while the job runs. |
 | **Worker UIs**, [localhost:8081](http://localhost:8081) and [localhost:8082](http://localhost:8082) | Each executor's stdout and stderr. |
-| **RustFS console**, [localhost:9001](http://localhost:9001) | New files under `warehouse/sales/orders/data/created_at_day=…/` and `metadata/`. |
+| **RustFS console**, [localhost:9001/rustfs/console/](http://localhost:9001/rustfs/console/) | New files under `warehouse/sales/orders/data/created_at_day=…/` and `metadata/`. |
 
 Task logs are also plain files on your machine:
 

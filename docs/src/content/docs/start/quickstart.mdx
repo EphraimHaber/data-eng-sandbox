@@ -94,7 +94,7 @@ SHOW NAMESPACES;      -- `sales` appears after the first sync
 | Spark master | [localhost:8090](http://localhost:8090) | Workers, running and finished applications |
 | Spark workers | [localhost:8081](http://localhost:8081), [localhost:8082](http://localhost:8082) | Executors and their logs |
 | Spark driver | [localhost:4040](http://localhost:4040) | Only while a job runs |
-| RustFS console | [localhost:9001](http://localhost:9001) | Log in with `S3_ACCESS_KEY` / `S3_SECRET_KEY` from `.env` |
+| RustFS console | [localhost:9001/rustfs/console/](http://localhost:9001/rustfs/console/) | Log in with `S3_ACCESS_KEY` / `S3_SECRET_KEY` from `.env`. The bare `:9001` root returns a 403. |
 | Iceberg REST catalog | [localhost:8181/v1/config](http://localhost:8181/v1/config) | JSON only |
 | Source Postgres | `localhost:5433` | `psql -h localhost -p 5433 -U shop shop`, password `shop` |
 
